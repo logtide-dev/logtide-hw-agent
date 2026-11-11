@@ -63,7 +63,10 @@ jobs:
           V="${{ steps.version.outputs.version }}"
           T="logtide/hw-agent:${V},ghcr.io/${{ github.repository_owner }}/logtide-hw-agent:${V}"
           if [ "${{ steps.version.outputs.stable }}" = "true" ]; then
-            T="${T},logtide/hw-agent:latest,ghcr.io/${{ github.repository_owner }}/logtide-hw-agent:latest"
+            MAJOR="${V%%.*}"
+            for t in "${MAJOR}" latest; do
+              T="${T},logtide/hw-agent:${t},ghcr.io/${{ github.repository_owner }}/logtide-hw-agent:${t}"
+            done
           fi
           echo "tags=${T}" >> "$GITHUB_OUTPUT"
 
