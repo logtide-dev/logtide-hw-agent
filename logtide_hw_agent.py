@@ -30,7 +30,7 @@ import urllib.request
 from collections import namedtuple
 from datetime import datetime, timezone
 
-AGENT_VERSION = "1.7.0"
+AGENT_VERSION = "1.0.0"
 SERVICE_NAME = "logtide-hw-agent"
 EVENT_SERVICE = "hardware"
 

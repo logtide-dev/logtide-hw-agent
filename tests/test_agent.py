@@ -501,7 +501,7 @@ class HostInfoTest(TmpRootCase):
         self.assertEqual(info.attrs["hw.vendor"], "Dell Inc.")
         self.assertEqual(info.attrs["hw.model"], "PowerEdge R740")
         self.assertEqual(info.attrs["os.kernel"], "6.8.0-45-generic")
-        self.assertEqual(info.attrs["agent.version"], "1.7.0")
+        self.assertEqual(info.attrs["agent.version"], "1.0.0")
         self.assertEqual(one(m, "hw.memory.size").value, 16384000 * 1024)
 
     def test_vm_by_hypervisor_flag(self):
@@ -702,7 +702,7 @@ class ConfigTest(TmpRootCase):
         self.assertEqual(cfg.interval, 60)
         self.assertEqual(cfg.state_dir, "/var/lib/logtide-hw-agent")
         self.assertFalse(cfg.dry_run)
-        self.assertEqual(agent.AGENT_VERSION, "1.7.0")
+        self.assertEqual(agent.AGENT_VERSION, "1.0.0")
 
 
 class FakeResponse(object):
