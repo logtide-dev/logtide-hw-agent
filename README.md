@@ -1,5 +1,8 @@
 # LogTide hardware agent
 
+[![CI](https://github.com/logtide-dev/logtide-hw-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/logtide-dev/logtide-hw-agent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Reads hardware health signals from a physical host and sends them to LogTide:
 SMART (HDD, SSD, NVMe), ECC memory errors (EDAC), temperatures, fans and
 voltages (hwmon, IPMI), CPU thermal throttling, physical NIC counters, kernel
@@ -10,6 +13,16 @@ Single Python file, standard library only (Python 3.8+). It runs as root because
 SMART, `/dev/kmsg` and IPMI need raw device access. On a VM most sensors do not
 exist; the agent reports that the host is virtual and the collectors that find
 nothing report status 0.
+
+## Compatibility
+
+Requires LogTide 1.7.0 or later (the Monitor > Hardware section and the `hw.*`
+metric contract). Hosted LogTide Cloud is supported: point `LOGTIDE_URL` at
+`https://api.logtide.dev`. The metrics, attributes and health rules are documented at
+[logtide.dev/docs/hardware-health](https://logtide.dev/docs/hardware-health).
+
+The agent follows semantic versioning independently of LogTide. A change to the
+metric contract that older LogTide versions cannot read is a major version.
 
 ## Run with Docker
 
@@ -50,16 +63,16 @@ Without `--privileged` you need `--cap-add SYS_RAWIO --cap-add SYS_ADMIN
 (seccomp and AppArmor profiles vary) and privileged is the tested path.
 
 With the LogTide compose stack: `docker compose --profile hardware up -d`
-(see `docker/docker-compose.yml`).
+(see `docker/docker-compose.yml` in the [LogTide repository](https://github.com/logtide-dev/logtide)).
 
 ## Run with systemd
 
 ```bash
 sudo apt install -y python3 smartmontools ipmitool   # ipmitool only on servers with a BMC
 sudo install -d /opt/logtide-hw-agent /etc/logtide
-sudo curl -fsSL https://raw.githubusercontent.com/logtide-dev/logtide/main/hw-agent/logtide_hw_agent.py \
+sudo curl -fsSL https://raw.githubusercontent.com/logtide-dev/logtide-hw-agent/main/logtide_hw_agent.py \
   -o /opt/logtide-hw-agent/logtide_hw_agent.py
-sudo curl -fsSL https://raw.githubusercontent.com/logtide-dev/logtide/main/hw-agent/logtide-hw-agent.service \
+sudo curl -fsSL https://raw.githubusercontent.com/logtide-dev/logtide-hw-agent/main/logtide-hw-agent.service \
   -o /etc/systemd/system/logtide-hw-agent.service
 sudo tee /etc/logtide/hw-agent.env >/dev/null <<'ENV'
 LOGTIDE_URL=https://api.logtide.dev
@@ -114,5 +127,5 @@ journalctl -u logtide-hw-agent -f
 ## Tests
 
 ```bash
-python -m unittest discover -s hw-agent/tests
+python -m unittest discover -s tests
 ```
