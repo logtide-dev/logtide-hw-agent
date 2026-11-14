@@ -14,6 +14,8 @@ SMART, `/dev/kmsg` and IPMI need raw device access. On a VM most sensors do not
 exist; the agent reports that the host is virtual and the collectors that find
 nothing report status 0.
 
+![A host in LogTide's Monitor > Hardware: a disk reallocating sectors and a DIMM logging corrected ECC errors](docs/hardware-host.png)
+
 ## Compatibility
 
 Requires LogTide 1.7.0 or later (the Monitor > Hardware section and the `hw.*`
