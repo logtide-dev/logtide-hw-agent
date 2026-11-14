@@ -12,15 +12,14 @@ jobs:
   test:
     name: Tests (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
+    # Official Python images: setup-python has no 3.8 build for current runners.
+    container: python:${{ matrix.python }}-slim
     strategy:
       fail-fast: false
       matrix:
         python: ['3.8', '3.12']
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
       - name: Run tests
         run: python -m unittest discover -s tests -v
 
@@ -35,6 +34,7 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: logtide/hw-agent:ci
       - name: Smoke test
         run: |
