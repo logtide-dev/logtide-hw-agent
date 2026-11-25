@@ -134,8 +134,8 @@ that goes backwards (reboot, wrap) skips one cycle.
 
 | Metric | Unit | Attributes | Source |
 |---|---|---|---|
-| `system.cpu.utilization` | % (0-100) | `system.cpu.state` = `user`, `system`, `iowait`, `steal`, `idle` (they add up to 1) | `/proc/stat` deltas |
-| `system.cpu.utilization.total` | % | none | busy share: `1 - idle - iowait` |
+| `system.cpu.utilization` | % (0-100) | `system.cpu.state` = `user`, `system`, `iowait`, `steal`, `idle` (they add up to 100) | `/proc/stat` deltas |
+| `system.cpu.utilization.total` | % | none | busy share: `100 - idle - iowait` |
 | `system.cpu.load_average.1m`, `.5m`, `.15m` | 1 | none | `/proc/loadavg` |
 | `system.memory.usage` | By | `system.memory.state` = `used` (total minus `MemAvailable`), `free`, `cached` (page cache plus reclaimable slab), `buffers` | `/proc/meminfo` |
 | `system.memory.utilization` | % | none | used / total |
