@@ -2,7 +2,8 @@
 """LogTide hardware agent.
 
 Collects hardware health signals (SMART, EDAC, hwmon, thermal throttling, IPMI,
-NIC counters, kernel and BMC events) and ships them to LogTide:
+NIC counters, kernel and BMC events) plus host resource usage (CPU, memory,
+swap, filesystems, disk and network throughput) and ships them to LogTide:
 
   * metrics as OTLP JSON gauges to      POST {LOGTIDE_URL}/v1/otlp/metrics
   * events  as logs (service=hardware) to POST {LOGTIDE_URL}/api/v1/ingest
@@ -30,14 +31,14 @@ import urllib.request
 from collections import namedtuple
 from datetime import datetime, timezone
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.0"
 SERVICE_NAME = "logtide-hw-agent"
 EVENT_SERVICE = "hardware"
 
 log = logging.getLogger("logtide-hw-agent")
 
 # Collectors that report hw.agent.collector.status (contract names).
-ALL_COLLECTORS = ("smart", "edac", "hwmon", "thermal", "ipmi", "sel", "net", "kmsg")
+ALL_COLLECTORS = ("smart", "edac", "hwmon", "thermal", "ipmi", "sel", "net", "system", "kmsg")
 
 # One data point before it is encoded as OTLP.
 Metric = namedtuple("Metric", "name value hw_type hw_id attrs")
@@ -65,6 +66,21 @@ UNITS = {
     "hw.network.errors": "1",
     "hw.network.carrier_changes": "1",
     "hw.network.up": "1",
+    "system.cpu.utilization": "%",
+    "system.cpu.utilization.total": "%",
+    "system.cpu.load_average.1m": "1",
+    "system.cpu.load_average.5m": "1",
+    "system.cpu.load_average.15m": "1",
+    "system.memory.usage": "By",
+    "system.memory.utilization": "%",
+    "system.paging.usage": "By",
+    "system.paging.utilization": "%",
+    "system.filesystem.usage": "By",
+    "system.filesystem.utilization": "%",
+    "system.disk.io.rate": "By/s",
+    "system.disk.operations.rate": "{operation}/s",
+    "system.network.io.rate": "By/s",
+    "system.uptime": "s",
 }
 
 
@@ -194,9 +210,24 @@ class Context(object):
         self.abandoned = {}  # smart device -> stuck child process
         self._stuck_logged = set()
         self._unavailable_logged = set()
+        self.prev = {}  # previous counter samples of the system collector
+        self.clock = time.monotonic
+        self.statvfs = getattr(os, "statvfs", None)  # Linux only
 
     def path(self, p):
         return self.config.path(p)
+
+    def fs_visible(self, mountpoint):
+        """True when `mountpoint` can be measured. Without HOST_ROOT every path is
+        the host's own. With HOST_ROOT the host filesystem is only there when the
+        host root was bind mounted; an unmounted /host is an empty directory of
+        the container and would report the container's own filesystem."""
+        if not self.config.host_root:
+            return True
+        try:
+            return os.stat(self.path(mountpoint)).st_dev != os.stat("/").st_dev
+        except OSError:
+            return False
 
     def smartctl_available(self):
         return shutil.which("smartctl") is not None
@@ -1147,6 +1178,216 @@ def collect_kmsg_status(ctx):
     return []
 
 
+# ---------------------------------------------------------------------------
+# system (host resource usage, OpenTelemetry system.* names)
+# ---------------------------------------------------------------------------
+
+# Utilization metrics are percentages (0-100, unit "%"), not 0-1 ratios: that is
+# what the LogTide Metrics page formats and what the Fluent Bit system metrics send.
+
+# Filesystem types that are not storage.
+PSEUDO_FS = frozenset((
+    "proc", "sysfs", "tmpfs", "devtmpfs", "devpts", "overlay", "squashfs", "cgroup", "cgroup2",
+    "securityfs", "debugfs", "tracefs", "configfs", "fusectl", "pstore", "bpf", "autofs",
+    "mqueue", "hugetlbfs", "binfmt_misc", "rpc_pipefs", "nsfs", "efivarfs", "ramfs", "selinuxfs",
+    "fuse.lxcfs", "fuse.gvfsd-fuse", "fuse.portal", "iso9660", "aufs", "devfs",
+))
+WHOLE_DISK_RE = re.compile(r"^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme\d+n\d+|mmcblk\d+|md\d+)$")
+SKIP_IFACE_RE = re.compile(r"^(lo|veth.*)$")
+SECTOR_BYTES = 512
+CPU_STATES = ("user", "system", "iowait", "steal", "idle")
+
+
+def _proc_text(ctx, rel):
+    """Read /proc/<rel>. Inside a container /proc/mounts and /proc/net/dev are
+    symlinks to the reader's own namespace, so with HOST_ROOT the host view is
+    /proc/1/<rel>."""
+    if ctx.config.host_root:
+        text = read_text(ctx.path("/proc/1/" + rel))
+        if text:
+            return text
+    return read_text(ctx.path("/proc/" + rel))
+
+
+def parse_cpu_times(text):
+    """First line of /proc/stat -> jiffies per CPU_STATES (user includes nice,
+    system includes irq and softirq), or None."""
+    for line in (text or "").splitlines():
+        if line.startswith("cpu "):
+            f = [int(x) for x in line.split()[1:] if x.isdigit()]
+            f += [0] * (8 - len(f))
+            user, nice, system, idle, iowait, irq, softirq, steal = f[:8]
+            return (user + nice, system + irq + softirq, iowait, steal, idle)
+    return None
+
+
+def parse_meminfo(text):
+    info = {}
+    for line in (text or "").splitlines():
+        m = re.match(r"^(\w+)(?:\(\w+\))?:\s+(\d+)", line)
+        if m:
+            info[m.group(1)] = int(m.group(2)) * 1024
+    return info
+
+
+def parse_mounts(text):
+    """/proc/mounts -> [(device, mountpoint, fstype)] of real filesystems, one
+    per device (the first mountpoint wins, so bind mounts do not double count)."""
+    seen = set()
+    out = []
+    for line in (text or "").splitlines():
+        f = line.split()
+        if len(f) < 3:
+            continue
+        dev, mnt, fstype = f[0], f[1].replace("\\040", " "), f[2]
+        if fstype in PSEUDO_FS or fstype.startswith("cgroup"):
+            continue
+        if not dev.startswith("/") and ":" not in dev and not fstype.startswith("fuse"):
+            continue  # no backing device (none, systemd-1, ...)
+        if dev in seen:
+            continue
+        seen.add(dev)
+        out.append((dev, mnt, fstype))
+    return out
+
+
+def parse_diskstats(text):
+    """/proc/diskstats -> {disk: (read_bytes, write_bytes, read_ops, write_ops)} for
+    whole disks only (no partitions, loop, ram or dm devices)."""
+    out = {}
+    for line in (text or "").splitlines():
+        f = line.split()
+        if len(f) < 10 or not WHOLE_DISK_RE.match(f[2]):
+            continue
+        try:
+            out[f[2]] = (int(f[5]) * SECTOR_BYTES, int(f[9]) * SECTOR_BYTES, int(f[3]), int(f[7]))
+        except ValueError:
+            continue
+    return out
+
+
+def parse_net_dev(text):
+    """/proc/net/dev -> {iface: (rx_bytes, tx_bytes)} without lo and veth."""
+    out = {}
+    for line in (text or "").splitlines():
+        name, sep, rest = line.partition(":")
+        name = name.strip()
+        if not sep or not name or SKIP_IFACE_RE.match(name):
+            continue
+        f = rest.split()
+        if len(f) < 9:
+            continue
+        try:
+            out[name] = (int(f[0]), int(f[8]))
+        except ValueError:
+            continue
+    return out
+
+
+def _deltas(ctx, key, current, now):
+    """Change of a {id: (counter, ...)} sample since the previous cycle, as
+    {id: (delta, ...)} plus the elapsed seconds. Empty on the first cycle; an id
+    whose counter went backwards (reset) is skipped for one cycle."""
+    prev = ctx.prev.get(key)
+    ctx.prev[key] = (now, current)
+    if prev is None or now - prev[0] <= 0:
+        return {}, 0.0
+    then, old = prev
+    out = {}
+    for ident, values in current.items():
+        before = old.get(ident)
+        if before is None or len(before) != len(values):
+            continue
+        d = tuple(v - b for v, b in zip(values, before))
+        if min(d) >= 0:
+            out[ident] = d
+    return out, now - then
+
+
+def collect_system(ctx):
+    now = ctx.clock()
+    metrics = []
+
+    def add(name, value, hw_id, attrs=None):
+        metrics.append(Metric(name, value, "system", hw_id, attrs or {}))
+
+    cpu = parse_cpu_times(read_text(ctx.path("/proc/stat")))
+    if cpu is None:
+        raise CollectorUnavailable("no /proc/stat")
+    deltas, _ = _deltas(ctx, "cpu", {"cpu": cpu}, now)
+    if "cpu" in deltas and sum(deltas["cpu"]) > 0:
+        d = deltas["cpu"]
+        total = float(sum(d))
+        for state, jiffies in zip(CPU_STATES, d):
+            add("system.cpu.utilization", 100.0 * jiffies / total, "cpu", {"system.cpu.state": state})
+        busy = 1.0 - (d[CPU_STATES.index("idle")] + d[CPU_STATES.index("iowait")]) / total
+        add("system.cpu.utilization.total", 100.0 * busy, "cpu")
+
+    load = (read_text(ctx.path("/proc/loadavg")) or "").split()
+    if len(load) >= 3:
+        for label, raw in zip(("1m", "5m", "15m"), load[:3]):
+            try:
+                add("system.cpu.load_average." + label, float(raw), "cpu")
+            except ValueError:
+                pass
+
+    mem = parse_meminfo(read_text(ctx.path("/proc/meminfo")))
+    total = mem.get("MemTotal", 0)
+    if total > 0:
+        available = mem.get("MemAvailable", mem.get("MemFree", 0) + mem.get("Cached", 0))
+        used = max(0, total - available)
+        add("system.memory.usage", used, "memory", {"system.memory.state": "used"})
+        add("system.memory.usage", mem.get("MemFree", 0), "memory", {"system.memory.state": "free"})
+        add("system.memory.usage", mem.get("Cached", 0) + mem.get("SReclaimable", 0), "memory",
+            {"system.memory.state": "cached"})
+        add("system.memory.usage", mem.get("Buffers", 0), "memory", {"system.memory.state": "buffers"})
+        add("system.memory.utilization", 100.0 * used / total, "memory")
+    swap_total = mem.get("SwapTotal", 0)
+    if swap_total > 0:
+        swap_used = max(0, swap_total - mem.get("SwapFree", 0))
+        add("system.paging.usage", swap_used, "swap", {"system.paging.state": "used"})
+        add("system.paging.usage", swap_total - swap_used, "swap", {"system.paging.state": "free"})
+        add("system.paging.utilization", 100.0 * swap_used / swap_total, "swap")
+
+    for dev, mnt, fstype in parse_mounts(_proc_text(ctx, "mounts")):
+        if ctx.statvfs is None or not ctx.fs_visible(mnt):
+            continue
+        try:
+            st = ctx.statvfs(ctx.path(mnt))
+        except OSError:
+            continue
+        if st.f_blocks * st.f_frsize <= 0:
+            continue
+        used = (st.f_blocks - st.f_bfree) * st.f_frsize
+        free = st.f_bavail * st.f_frsize
+        attrs = {"system.device": dev, "system.filesystem.mountpoint": mnt,
+                 "system.filesystem.type": fstype}
+        add("system.filesystem.usage", used, mnt, dict(attrs, **{"system.filesystem.state": "used"}))
+        add("system.filesystem.usage", free, mnt, dict(attrs, **{"system.filesystem.state": "free"}))
+        add("system.filesystem.utilization", 100.0 * used / (used + free) if used + free else 0.0, mnt, attrs)
+
+    deltas, dt = _deltas(ctx, "disk", parse_diskstats(read_text(ctx.path("/proc/diskstats"))), now)
+    for disk, (rb, wb, ro, wo) in deltas.items():
+        for name, direction, value in (("system.disk.io.rate", "read", rb),
+                                       ("system.disk.io.rate", "write", wb),
+                                       ("system.disk.operations.rate", "read", ro),
+                                       ("system.disk.operations.rate", "write", wo)):
+            add(name, value / dt, disk, {"system.device": disk, "disk.io.direction": direction})
+
+    deltas, dt = _deltas(ctx, "net", parse_net_dev(_proc_text(ctx, "net/dev")), now)
+    for iface, (rx, tx) in deltas.items():
+        add("system.network.io.rate", rx / dt, iface,
+            {"system.device": iface, "network.io.direction": "receive"})
+        add("system.network.io.rate", tx / dt, iface,
+            {"system.device": iface, "network.io.direction": "transmit"})
+
+    try:
+        add("system.uptime", float((read_text(ctx.path("/proc/uptime")) or "").split()[0]), "host")
+    except (IndexError, ValueError):
+        pass
+    return metrics
+
+
 COLLECTORS = {
     "smart": collect_smart,
     "edac": collect_edac,
@@ -1155,6 +1396,7 @@ COLLECTORS = {
     "ipmi": collect_ipmi,
     "sel": collect_sel,
     "net": collect_net,
+    "system": collect_system,
     "kmsg": collect_kmsg_status,
 }
 

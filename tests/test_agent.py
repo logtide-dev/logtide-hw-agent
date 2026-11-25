@@ -486,6 +486,194 @@ class NetTest(TmpRootCase):
         self.assertNotIn("speed_mbps", up.attrs)
 
 
+STAT1 = "cpu  1000 100 500 8000 200 50 50 100 0 0\ncpu0 1 1 1 1 1 1 1 1 0 0\n"
+# +300 user, +200 system (+200 cpu, +10 irq, -10 softirq), +100 iowait, +400 idle
+STAT2 = "cpu  1300 100 700 8400 300 60 40 100 0 0\n"
+MEMINFO = (
+    "MemTotal:       16000000 kB\nMemFree:         2000000 kB\nMemAvailable:    8000000 kB\n"
+    "Buffers:          500000 kB\nCached:          4000000 kB\nSReclaimable:     500000 kB\n"
+    "SwapTotal:       2000000 kB\nSwapFree:        1500000 kB\n")
+MOUNTS = (
+    "sysfs /sys sysfs rw 0 0\nproc /proc proc rw 0 0\n/dev/sda1 / ext4 rw 0 0\n"
+    "tmpfs /run tmpfs rw 0 0\noverlay /var/lib/docker/overlay2/x/merged overlay rw 0 0\n"
+    "/dev/sda1 /var/lib/docker ext4 rw 0 0\n/dev/nvme0n1p2 /data xfs rw 0 0\n"
+    "cgroup2 /sys/fs/cgroup cgroup2 rw 0 0\n/dev/loop0 /snap/core squashfs ro 0 0\n"
+    "nas:/export /mnt/nas nfs4 rw 0 0\n")
+DISKSTATS1 = (
+    "   8       0 sda 100 0 2000 0 50 0 1000 0 0 0 0\n"
+    "   8       1 sda1 90 0 1800 0 40 0 900 0 0 0 0\n"
+    " 259       0 nvme0n1 10 0 100 0 10 0 100 0 0 0 0\n"
+    "   7       0 loop0 5 0 50 0 0 0 0 0 0 0 0\n")
+DISKSTATS2 = (
+    "   8       0 sda 200 0 4000 0 150 0 3000 0 0 0 0\n"
+    "   8       1 sda1 190 0 3800 0 140 0 2900 0 0 0 0\n"
+    " 259       0 nvme0n1 10 0 100 0 10 0 100 0 0 0 0\n"
+    "   7       0 loop0 5 0 50 0 0 0 0 0 0 0 0\n")
+NETDEV_HEAD = ("Inter-|   Receive                                                |  Transmit\n"
+               " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n")
+
+
+def netdev(eth_rx, eth_tx):
+    return (NETDEV_HEAD +
+            "    lo: 5000 10 0 0 0 0 0 0 5000 10 0 0 0 0 0 0\n"
+            "  eth0: %d 100 0 0 0 0 0 0 %d 90 0 0 0 0 0 0\n"
+            "veth1a: 1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0\n" % (eth_rx, eth_tx))
+
+
+class FakeStat(object):
+    def __init__(self, blocks, bfree, bavail, frsize=4096):
+        self.f_blocks, self.f_bfree, self.f_bavail, self.f_frsize = blocks, bfree, bavail, frsize
+
+
+class SystemTest(TmpRootCase):
+    def setUp(self):
+        TmpRootCase.setUp(self)
+        self.now = [100.0]
+        self.ctx.clock = lambda: self.now[0]
+        self.ctx.fs_visible = lambda mnt: True
+        sizes = {"/": FakeStat(1000, 400, 300), "/data": FakeStat(2000, 1000, 1000),
+                 "/mnt/nas": FakeStat(0, 0, 0)}
+        root = self.root
+
+        def statvfs(path):
+            key = path[len(root):] or "/"
+            if key not in sizes:
+                raise OSError("no such mount")
+            return sizes[key]
+
+        self.ctx.statvfs = statvfs
+        write(self.root, "proc/stat", STAT1)
+        write(self.root, "proc/loadavg", "0.52 0.40 0.31 1/300 1234\n")
+        write(self.root, "proc/meminfo", MEMINFO)
+        write(self.root, "proc/1/mounts", MOUNTS)
+        write(self.root, "proc/diskstats", DISKSTATS1)
+        write(self.root, "proc/1/net/dev", netdev(1000, 2000))
+        write(self.root, "proc/uptime", "3600.50 7000.00\n")
+
+    def second_cycle(self):
+        agent.collect_system(self.ctx)
+        self.now[0] = 110.0
+        write(self.root, "proc/stat", STAT2)
+        write(self.root, "proc/diskstats", DISKSTATS2)
+        write(self.root, "proc/1/net/dev", netdev(11000, 7000))
+        return agent.collect_system(self.ctx)
+
+    def test_first_cycle_has_no_rates(self):
+        m = agent.collect_system(self.ctx)
+        for name in ("system.cpu.utilization", "system.cpu.utilization.total",
+                     "system.disk.io.rate", "system.disk.operations.rate", "system.network.io.rate"):
+            self.assertEqual(by(m, name), [], name)
+        self.assertEqual(one(m, "system.cpu.load_average.1m").value, 0.52)
+        self.assertEqual(one(m, "system.cpu.load_average.15m").value, 0.31)
+        self.assertEqual(one(m, "system.uptime").value, 3600.5)
+        self.assertTrue(all(x.hw_type == "system" for x in m))
+
+    def test_cpu_utilization_from_deltas(self):
+        m = self.second_cycle()
+        total = 1000.0
+        got = {x.attrs["system.cpu.state"]: x.value for x in by(m, "system.cpu.utilization")}
+        self.assertEqual(set(got), {"user", "system", "iowait", "steal", "idle"})
+        self.assertAlmostEqual(got["user"], 30.0)
+        self.assertAlmostEqual(got["system"], 20.0)
+        self.assertAlmostEqual(got["iowait"], 10.0)
+        self.assertAlmostEqual(got["idle"], 40.0)
+        self.assertAlmostEqual(sum(got.values()), 100.0)
+        self.assertAlmostEqual(one(m, "system.cpu.utilization.total").value, 50.0)
+
+    def test_memory_and_swap(self):
+        m = agent.collect_system(self.ctx)
+        kb = 1024
+        self.assertEqual(one(m, "system.memory.usage", **{"system.memory.state": "used"}).value, 8000000 * kb)
+        self.assertEqual(one(m, "system.memory.usage", **{"system.memory.state": "free"}).value, 2000000 * kb)
+        self.assertEqual(one(m, "system.memory.usage", **{"system.memory.state": "cached"}).value, 4500000 * kb)
+        self.assertEqual(one(m, "system.memory.usage", **{"system.memory.state": "buffers"}).value, 500000 * kb)
+        self.assertAlmostEqual(one(m, "system.memory.utilization").value, 50.0)
+        self.assertEqual(one(m, "system.paging.usage", **{"system.paging.state": "used"}).value, 500000 * kb)
+        self.assertAlmostEqual(one(m, "system.paging.utilization").value, 25.0)
+
+    def test_no_swap_emits_no_paging(self):
+        write(self.root, "proc/meminfo", MEMINFO.replace("SwapTotal:       2000000", "SwapTotal:       0"))
+        m = agent.collect_system(self.ctx)
+        self.assertEqual(by(m, "system.paging.usage"), [])
+        self.assertEqual(by(m, "system.paging.utilization"), [])
+
+    def test_filesystems_real_only_deduped(self):
+        m = agent.collect_system(self.ctx)
+        mounts = sorted(x.attrs["system.filesystem.mountpoint"] for x in by(m, "system.filesystem.utilization"))
+        # pseudo fs, loop/squashfs and the second mount of /dev/sda1 are skipped, nas has no size
+        self.assertEqual(mounts, ["/", "/data"])
+        used = one(m, "system.filesystem.usage", **{"system.filesystem.mountpoint": "/",
+                                                     "system.filesystem.state": "used"})
+        self.assertEqual(used.value, 600 * 4096)
+        self.assertEqual(used.attrs["system.device"], "/dev/sda1")
+        self.assertEqual(used.attrs["system.filesystem.type"], "ext4")
+        free = one(m, "system.filesystem.usage", **{"system.filesystem.mountpoint": "/",
+                                                     "system.filesystem.state": "free"})
+        self.assertEqual(free.value, 300 * 4096)
+        util = one(m, "system.filesystem.utilization", **{"system.filesystem.mountpoint": "/"})
+        self.assertAlmostEqual(util.value, 100.0 * 600 / 900)
+
+    def test_filesystems_skipped_when_host_root_not_mounted(self):
+        self.ctx.fs_visible = lambda mnt: False
+        self.assertEqual(by(agent.collect_system(self.ctx), "system.filesystem.usage"), [])
+
+    def test_disk_rates_whole_disks_only(self):
+        m = self.second_cycle()
+        self.assertEqual({x.hw_id for x in by(m, "system.disk.io.rate")}, {"sda", "nvme0n1"})
+        r = one([x for x in m if x.hw_id == "sda"], "system.disk.io.rate", **{"disk.io.direction": "read"})
+        w = one([x for x in m if x.hw_id == "sda"], "system.disk.io.rate", **{"disk.io.direction": "write"})
+        self.assertAlmostEqual(r.value, 2000 * 512 / 10.0)
+        self.assertAlmostEqual(w.value, 2000 * 512 / 10.0)
+        ops = one([x for x in m if x.hw_id == "sda"], "system.disk.operations.rate", **{"disk.io.direction": "write"})
+        self.assertAlmostEqual(ops.value, 10.0)
+        self.assertEqual(one([x for x in m if x.hw_id == "nvme0n1"], "system.disk.io.rate", **{"disk.io.direction": "read"}).value, 0)
+
+    def test_network_rates_skip_lo_and_veth(self):
+        m = self.second_cycle()
+        self.assertEqual({x.hw_id for x in by(m, "system.network.io.rate")}, {"eth0"})
+        rx = one(m, "system.network.io.rate", **{"network.io.direction": "receive"})
+        tx = one(m, "system.network.io.rate", **{"network.io.direction": "transmit"})
+        self.assertAlmostEqual(rx.value, 1000.0)
+        self.assertAlmostEqual(tx.value, 500.0)
+
+    def test_counter_reset_is_skipped_for_one_cycle(self):
+        agent.collect_system(self.ctx)
+        self.now[0] = 110.0
+        write(self.root, "proc/1/net/dev", netdev(10, 10))  # lower than before: reboot or wrap
+        self.assertEqual(by(agent.collect_system(self.ctx), "system.network.io.rate"), [])
+        self.now[0] = 120.0
+        write(self.root, "proc/1/net/dev", netdev(1010, 510))
+        m = agent.collect_system(self.ctx)
+        rx = one(m, "system.network.io.rate", **{"network.io.direction": "receive"})
+        self.assertAlmostEqual(rx.value, 100.0)
+
+    def test_host_view_only_with_host_root(self):
+        ctx = agent.Context(agent.Config({}))
+        with mock.patch.object(agent, "read_text", return_value="x") as rt:
+            agent._proc_text(ctx, "mounts")
+        rt.assert_called_once_with("/proc/mounts")
+        with mock.patch.object(agent, "read_text", return_value="x") as rt:
+            agent._proc_text(self.ctx, "mounts")
+        rt.assert_called_once_with(self.root + "/proc/1/mounts")
+
+    def test_missing_proc_stat_is_unavailable(self):
+        os.remove(os.path.join(self.root, "proc", "stat"))
+        with self.assertRaises(agent.CollectorUnavailable):
+            agent.collect_system(self.ctx)
+
+    def test_selectable_and_units(self):
+        self.assertIn("system", agent.ALL_COLLECTORS)
+        self.assertEqual(agent.Config({"LOGTIDE_HW_COLLECTORS": "net,system"}).collectors, ["net", "system"])
+        self.assertEqual(agent.Config({"LOGTIDE_HW_COLLECTORS": "smart"}).collectors, ["smart"])
+        m = agent.run_collectors(self.ctx, ["system"])
+        self.assertEqual(one(m, "hw.agent.collector.status", collector="system").value, 1)
+        payload = agent.build_otlp_metrics(m, "h")
+        units = {x["name"]: x["unit"] for x in payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]}
+        self.assertEqual(units["system.memory.usage"], "By")
+        self.assertEqual(units["system.uptime"], "s")
+        self.assertEqual(units["system.memory.utilization"], "%")
+
+
 class HostInfoTest(TmpRootCase):
     def test_bare_metal(self):
         write(self.root, "sys/class/dmi/id/sys_vendor", "Dell Inc.\n")
@@ -501,7 +689,7 @@ class HostInfoTest(TmpRootCase):
         self.assertEqual(info.attrs["hw.vendor"], "Dell Inc.")
         self.assertEqual(info.attrs["hw.model"], "PowerEdge R740")
         self.assertEqual(info.attrs["os.kernel"], "6.8.0-45-generic")
-        self.assertEqual(info.attrs["agent.version"], "1.0.0")
+        self.assertEqual(info.attrs["agent.version"], "1.1.0")
         self.assertEqual(one(m, "hw.memory.size").value, 16384000 * 1024)
 
     def test_vm_by_hypervisor_flag(self):
@@ -702,7 +890,7 @@ class ConfigTest(TmpRootCase):
         self.assertEqual(cfg.interval, 60)
         self.assertEqual(cfg.state_dir, "/var/lib/logtide-hw-agent")
         self.assertFalse(cfg.dry_run)
-        self.assertEqual(agent.AGENT_VERSION, "1.0.0")
+        self.assertEqual(agent.AGENT_VERSION, "1.1.0")
 
 
 class FakeResponse(object):
