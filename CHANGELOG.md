@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0]
+
+### Added
+
+- `system` collector (enabled by default, switch it off by leaving it out of `LOGTIDE_HW_COLLECTORS`): host resource metrics with OpenTelemetry names read from `/proc` and `statvfs`. CPU utilization per state and total, load average, memory and swap usage and utilization, filesystem usage and utilization for real filesystems, disk and network throughput as per-second rates, and uptime. See the README for the full list.
+- `system` appears in `hw.agent.collector.status` like the other collectors.
+
 ## [1.0.0]
 
 First release, for LogTide 1.7.0.
