@@ -6,7 +6,9 @@
 Reads hardware health signals from a physical host and sends them to LogTide:
 SMART (HDD, SSD, NVMe), ECC memory errors (EDAC), temperatures, fans and
 voltages (hwmon, IPMI), CPU thermal throttling, physical NIC counters, kernel
-hardware errors (`/dev/kmsg`) and the BMC event log. Metrics go to
+hardware errors (`/dev/kmsg`) and the BMC event log. It also reports host resource
+usage (CPU, load, memory, swap, filesystems, disk and network throughput, uptime) with
+OpenTelemetry `system.*` names. Metrics go to
 `/v1/otlp/metrics`, events to `/api/v1/ingest` (service `hardware`).
 
 Single Python file, standard library only (Python 3.8+). It runs as root because
@@ -58,6 +60,12 @@ Why these mounts:
 - The `/etc/hostname` mount makes the host name match the real host instead of the
   container id. Alternatively set `LOGTIDE_HOSTNAME`.
 - The state volume keeps the BMC event log position across restarts.
+- Optional, for filesystem usage: add `-v /:/host:ro,rslave` (it replaces the separate
+  `/sys`, `/proc` and `/etc/hostname` mounts, which are then already under `/host`). The
+  agent measures the host mounts through `HOST_ROOT`. Without it the container cannot see
+  the host filesystems, so `system.filesystem.*` is left out (the other `system.*` metrics
+  still describe the host). The agent never reports the container's own filesystem as the
+  host's.
 
 Without `--privileged` you need `--cap-add SYS_RAWIO --cap-add SYS_ADMIN
 --cap-add SYSLOG` plus one `--device` per disk (`/dev/sda`, `/dev/nvme0`...),
@@ -101,12 +109,53 @@ journalctl -u logtide-hw-agent -f
 | `LOGTIDE_HOSTNAME` | `${HOST_ROOT}/etc/hostname`, else the system hostname | Value of `host.name` |
 | `HOST_ROOT` | empty | Prefix for `/sys`, `/proc` and `/etc` reads (`/host` in the container) |
 | `LOGTIDE_HW_INTERVAL` | `60` | Seconds between collections (minimum 5) |
-| `LOGTIDE_HW_COLLECTORS` | all | Comma list of `smart,edac,hwmon,thermal,ipmi,sel,net,kmsg` |
+| `LOGTIDE_HW_COLLECTORS` | all | Comma list of `smart,edac,hwmon,thermal,ipmi,sel,net,system,kmsg` |
 | `LOGTIDE_HW_STATE_DIR` | `/var/lib/logtide-hw-agent` | Where the last BMC event id is stored |
 | `LOGTIDE_HW_DRY_RUN` | off | `1` prints payloads to stdout instead of sending |
 | `LOGTIDE_HW_KMSG_PATH` | `/dev/kmsg` | Kernel log device (testing) |
 
+Collectors are enabled by default. Set `LOGTIDE_HW_COLLECTORS` to the ones you want to
+keep, for example `LOGTIDE_HW_COLLECTORS=smart,edac,hwmon,thermal,ipmi,sel,net,kmsg` turns
+the `system` collector off (a hardware-only agent), and `LOGTIDE_HW_COLLECTORS=system`
+runs only the resource metrics. An explicit list written for 1.0.x does not contain
+`system`, so upgrading such an agent does not start sending resource metrics until you add it.
+
 `--once` runs one collection, sends it and exits (exit code 1 if delivery failed).
+
+## System metrics
+
+The `system` collector reads `/proc` and `statvfs` (through `HOST_ROOT`, using
+`/proc/1/mounts` and `/proc/1/net/dev` in a container so it sees the host and not the
+container namespace). Like the `hw.*` metrics they are sent as OTLP gauges with
+`service.name=logtide-hw-agent`, `host.name`, and the `hw.type` (`system`) and `hw.id`
+attributes. Counters (disk and network) are sent as per-second rates computed between two
+cycles, so they chart directly; the first cycle after a start sends no rates and a counter
+that goes backwards (reboot, wrap) skips one cycle.
+
+| Metric | Unit | Attributes | Source |
+|---|---|---|---|
+| `system.cpu.utilization` | % (0-100) | `system.cpu.state` = `user`, `system`, `iowait`, `steal`, `idle` (they add up to 100) | `/proc/stat` deltas |
+| `system.cpu.utilization.total` | % | none | busy share: `100 - idle - iowait` |
+| `system.cpu.load_average.1m`, `.5m`, `.15m` | 1 | none | `/proc/loadavg` |
+| `system.memory.usage` | By | `system.memory.state` = `used` (total minus `MemAvailable`), `free`, `cached` (page cache plus reclaimable slab), `buffers` | `/proc/meminfo` |
+| `system.memory.utilization` | % | none | used / total |
+| `system.paging.usage` | By | `system.paging.state` = `used`, `free` | swap; nothing is sent without swap |
+| `system.paging.utilization` | % | none | swap used / total |
+| `system.filesystem.usage` | By | `system.device`, `system.filesystem.mountpoint`, `system.filesystem.type`, `system.filesystem.state` = `used`, `free` (available to unprivileged users, like `df`) | `/proc/mounts` + `statvfs` |
+| `system.filesystem.utilization` | % | `system.device`, `system.filesystem.mountpoint`, `system.filesystem.type` | used / (used + free), like `df` |
+| `system.disk.io.rate` | By/s | `system.device`, `disk.io.direction` = `read`, `write` | `/proc/diskstats` deltas |
+| `system.disk.operations.rate` | {operation}/s | `system.device`, `disk.io.direction` | `/proc/diskstats` deltas |
+| `system.network.io.rate` | By/s | `system.device`, `network.io.direction` = `receive`, `transmit` | `/proc/net/dev` deltas |
+| `system.uptime` | s | none | `/proc/uptime` |
+
+Utilization metrics are percentages from 0 to 100, not the 0-1 ratios of the OpenTelemetry
+specification: the LogTide Metrics page formats `*.utilization` values as percent.
+
+Filesystems: pseudo and virtual types (proc, sysfs, tmpfs, overlay, devtmpfs, cgroup,
+squashfs, ...) are skipped and a device mounted in several places is reported once, under
+its first mountpoint. Disks: whole disks only (`sd*`, `vd*`, `xvd*`, `hd*`, `nvme*n*`,
+`mmcblk*`, `md*`); partitions, loop, ram and device-mapper devices are skipped. Network:
+every interface except `lo` and `veth*`.
 
 ## Troubleshooting
 
