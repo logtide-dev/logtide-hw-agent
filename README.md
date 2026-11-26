@@ -157,6 +157,21 @@ its first mountpoint. Disks: whole disks only (`sd*`, `vd*`, `xvd*`, `hd*`, `nvm
 `mmcblk*`, `md*`); partitions, loop, ram and device-mapper devices are skipped. Network:
 every interface except `lo` and `veth*`.
 
+## Host information
+
+Every cycle, whatever `LOGTIDE_HW_COLLECTORS` says, the agent sends what LogTide shows in
+the header of the host page:
+
+| Metric | Unit | Attributes | Source |
+|---|---|---|---|
+| `hw.host.info` | 1 | `hw.virtual`, `agent.version`, `hw.vendor`, `hw.model`, `os.kernel`, `os.name`, `os.version`, `os.description` | DMI, `/proc/sys/kernel/osrelease`, `os-release` (`NAME`, `VERSION_ID`, `PRETTY_NAME`) |
+| `hw.memory.size` | By | none | `MemTotal` of `/proc/meminfo` |
+| `system.cpu.logical.count` | {cpu} | none | `/sys/devices/system/cpu/online`, else the `processor` entries of `/proc/cpuinfo` |
+
+`os-release` is read from `${HOST_ROOT}/etc/os-release`, or `/usr/lib/os-release` when that
+file is missing, so in the container it describes the host and not the agent image. An
+attribute whose source is missing is left out.
+
 ## Troubleshooting
 
 - **Collector status 0.** `hw.agent.collector.status` is 0 for a collector whose source is

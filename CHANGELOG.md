@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0]
+
+### Added
+
+- `hw.host.info` carries the operating system from `os-release`: `os.name`, `os.version` and `os.description` (for example `Debian GNU/Linux 12 (bookworm)`). LogTide 1.8 shows it on the host page instead of the bare kernel version.
+- `system.cpu.logical.count` (unit `{cpu}`): online logical CPUs from `/sys/devices/system/cpu/online`, falling back to `/proc/cpuinfo`. Sent with the host information, so it does not depend on the `system` collector.
+
 ## [1.1.0]
 
 ### Added
