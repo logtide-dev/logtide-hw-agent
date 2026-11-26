@@ -31,7 +31,7 @@ import urllib.request
 from collections import namedtuple
 from datetime import datetime, timezone
 
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.2.0"
 SERVICE_NAME = "logtide-hw-agent"
 EVENT_SERVICE = "hardware"
 
@@ -81,6 +81,7 @@ UNITS = {
     "system.disk.operations.rate": "{operation}/s",
     "system.network.io.rate": "By/s",
     "system.uptime": "s",
+    "system.cpu.logical.count": "{cpu}",
 }
 
 
@@ -935,6 +936,50 @@ VM_VENDOR_RE = re.compile(
     r"hyper-v|virtual machine|parallels|bhyve", re.I)
 
 
+def read_os_release(ctx):
+    """NAME, VERSION_ID and PRETTY_NAME of os-release(5), unquoted. The file is
+    /etc/os-release, or /usr/lib/os-release when that one is missing."""
+    text = read_text(ctx.path("/etc/os-release"))
+    if text is None:
+        text = read_text(ctx.path("/usr/lib/os-release"))
+    fields = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        fields[key.strip()] = value
+    return fields
+
+
+def count_logical_cpus(ctx, cpuinfo):
+    """Online logical CPUs from /sys/devices/system/cpu/online ("0-3,6"), else
+    the processor entries of /proc/cpuinfo. None when neither says."""
+    online = read_str(ctx.path("/sys/devices/system/cpu/online"))
+    if online:
+        total = 0
+        try:
+            for part in online.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if "-" in part:
+                    lo, hi = part.split("-", 1)
+                    total += int(hi) - int(lo) + 1
+                else:
+                    int(part)
+                    total += 1
+        except ValueError:
+            total = 0
+        if total > 0:
+            return total
+    n = len(re.findall(r"^processor\s*:", cpuinfo, re.M))
+    return n or None
+
+
 def collect_host(ctx):
     vendor = read_str(ctx.path("/sys/class/dmi/id/sys_vendor")) or ""
     model = read_str(ctx.path("/sys/class/dmi/id/product_name")) or ""
@@ -956,7 +1001,14 @@ def collect_host(ctx):
         attrs["hw.model"] = model
     if kernel:
         attrs["os.kernel"] = kernel
+    release = read_os_release(ctx)
+    for attr, field in (("os.name", "NAME"), ("os.version", "VERSION_ID"), ("os.description", "PRETTY_NAME")):
+        if release.get(field):
+            attrs[attr] = release[field]
     metrics = [Metric("hw.host.info", 1, "host", "host", attrs)]
+    cpus = count_logical_cpus(ctx, cpuinfo)
+    if cpus:
+        metrics.append(Metric("system.cpu.logical.count", cpus, "system", "cpu", {}))
     meminfo = read_text(ctx.path("/proc/meminfo")) or ""
     m = re.search(r"^MemTotal:\s+(\d+)\s*kB", meminfo, re.M)
     if m:

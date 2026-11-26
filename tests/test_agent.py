@@ -689,8 +689,54 @@ class HostInfoTest(TmpRootCase):
         self.assertEqual(info.attrs["hw.vendor"], "Dell Inc.")
         self.assertEqual(info.attrs["hw.model"], "PowerEdge R740")
         self.assertEqual(info.attrs["os.kernel"], "6.8.0-45-generic")
-        self.assertEqual(info.attrs["agent.version"], "1.1.0")
+        self.assertEqual(info.attrs["agent.version"], "1.2.0")
         self.assertEqual(one(m, "hw.memory.size").value, 16384000 * 1024)
+
+    def test_os_release(self):
+        write(self.root, "etc/os-release",
+              'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\nNAME="Debian GNU/Linux"\n'
+              'VERSION_ID="12"\nVERSION="12 (bookworm)"\nID=debian\n# comment\n\n')
+        self.ctx.run = lambda args, timeout=60: (1, "none\n")
+        attrs = one(agent.collect_host(self.ctx), "hw.host.info").attrs
+        self.assertEqual(attrs["os.description"], "Debian GNU/Linux 12 (bookworm)")
+        self.assertEqual(attrs["os.name"], "Debian GNU/Linux")
+        self.assertEqual(attrs["os.version"], "12")
+
+    def test_os_release_fallback_and_quoting(self):
+        # /etc/os-release is optional, /usr/lib/os-release is the fallback.
+        write(self.root, "usr/lib/os-release", "NAME='Alpine Linux'\nVERSION_ID=3.20.3\n")
+        self.ctx.run = lambda args, timeout=60: (1, "none\n")
+        attrs = one(agent.collect_host(self.ctx), "hw.host.info").attrs
+        self.assertEqual(attrs["os.name"], "Alpine Linux")
+        self.assertEqual(attrs["os.version"], "3.20.3")
+        self.assertNotIn("os.description", attrs)
+
+    def test_no_os_release(self):
+        self.ctx.run = lambda args, timeout=60: (1, "none\n")
+        attrs = one(agent.collect_host(self.ctx), "hw.host.info").attrs
+        for key in ("os.name", "os.version", "os.description"):
+            self.assertNotIn(key, attrs)
+
+    def test_logical_cpu_count_from_sysfs(self):
+        write(self.root, "sys/devices/system/cpu/online", "0-3,6,8-9\n")
+        write(self.root, "proc/cpuinfo", "processor : 0\nprocessor : 1\n")
+        self.ctx.run = lambda args, timeout=60: (1, "none\n")
+        count = one(agent.collect_host(self.ctx), "system.cpu.logical.count")
+        self.assertEqual(count.value, 7)
+        self.assertEqual(count.hw_type, "system")
+        self.assertEqual(count.hw_id, "cpu")
+
+    def test_logical_cpu_count_from_cpuinfo(self):
+        write(self.root, "proc/cpuinfo", "processor\t: 0\nflags : a\n\nprocessor\t: 1\nflags : a\n")
+        self.ctx.run = lambda args, timeout=60: (1, "none\n")
+        self.assertEqual(one(agent.collect_host(self.ctx), "system.cpu.logical.count").value, 2)
+
+    def test_no_cpu_count_when_unknown(self):
+        self.ctx.run = lambda args, timeout=60: (1, "none\n")
+        m = agent.collect_host(self.ctx)
+        self.assertEqual([x for x in m if x.name == "system.cpu.logical.count"], [])
+        payload = agent.build_otlp_metrics([agent.Metric("system.cpu.logical.count", 4, "system", "cpu", {})], "h")
+        self.assertEqual(payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["unit"], "{cpu}")
 
     def test_vm_by_hypervisor_flag(self):
         write(self.root, "proc/cpuinfo", "flags : fpu hypervisor sse\n")
@@ -890,7 +936,7 @@ class ConfigTest(TmpRootCase):
         self.assertEqual(cfg.interval, 60)
         self.assertEqual(cfg.state_dir, "/var/lib/logtide-hw-agent")
         self.assertFalse(cfg.dry_run)
-        self.assertEqual(agent.AGENT_VERSION, "1.1.0")
+        self.assertEqual(agent.AGENT_VERSION, "1.2.0")
 
 
 class FakeResponse(object):
